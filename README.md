@@ -1,36 +1,63 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Atlas — AI Project Command Center
 
-## Getting Started
+Софтуер за управление на проекти в стила на [vectal.ai](https://www.vectal.ai/): проекти, фирми, екип и **AI асистент**, който разбира контекста на всяка задача и работи по нея.
 
-First, run the development server:
+Направен е така, че да се ползва лесно и от хора **без технически познания** — тъмен, чист интерфейс, без излишни менюта.
+
+## Какво може
+
+- **Проекти** — за всеки проект: фирма-клиент, екип (кой работи), период (от–до), статус и прогрес.
+- **Фирми** — клиентите и техните контакти, свързани с проектите им.
+- **Задачи** — Kanban дъска с drag & drop, приоритети, отговорници, срокове и **отчитане на време** (кой, кога, колко часа).
+- **AI Асистент** — чат като Claude/ChatGPT. Свързваш чата с проект или задача и казваш „изпълни я" — асистентът знае контекста, прави план и я задвижва.
+- **Файлове** — снимки, документи, бележки и линкове към всеки проект/задача.
+- **Акаунти** — вход с няколко потребителя (демо акаунти готови за тест).
+
+## Стартиране
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Отвори <http://localhost:3000>. Влез с някой от **демо акаунтите** (бутоните долу на екрана за вход), напр. `ivan@studio.bg`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Режими на работа
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Приложението работи **веднага в демо режим** — данните се пазят локално в браузъра, AI отговаря с примерни (но контекстни) отговори. Така виждаш как изглежда и работи без никаква настройка.
 
-## Learn More
+### 1. Включване на облачна база (Supabase)
 
-To learn more about Next.js, take a look at the following resources:
+1. Създай безплатен проект в <https://supabase.com>.
+2. В SQL Editor пусни съдържанието на [`supabase/schema.sql`](./supabase/schema.sql) — създава таблиците, защитите (RLS) и автоматичните профили.
+3. Копирай `.env.local.example` в `.env.local` и попълни:
+   ```
+   NEXT_PUBLIC_SUPABASE_URL=...
+   NEXT_PUBLIC_SUPABASE_ANON_KEY=...
+   ```
+4. Клиентите вече са готови в `src/lib/supabase/`. Данните, акаунтите и качените файлове минават в облака.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### 2. Включване на реален AI (Claude)
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Добави `ANTHROPIC_API_KEY` в `.env.local` и замени `generateReply` в [`src/lib/ai.ts`](./src/lib/ai.ts) с извикване към Claude API през сървърен route. Сигнатурата вече подава контекста (проект + задача), така че замяната е права.
 
-## Deploy on Vercel
+## Структура
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```
+src/
+  app/                 # страници (Next.js App Router)
+    (app)/             # вътрешни екрани със sidebar (табло, проекти, задачи, чат…)
+    login/             # вход / регистрация
+  components/          # UI компоненти (дъска, чекмедже, модали, аватари…)
+  lib/
+    store.tsx          # състояние + локална персистенция (CRUD)
+    types.ts           # модел на данните (огледало на schema.sql)
+    seed.ts            # демо данни
+    ai.ts              # контекстен асистент (за замяна с Claude API)
+    supabase/          # клиенти за облака
+supabase/schema.sql    # схема за базата данни
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Преименуване на продукта
+
+Името „Atlas" е на едно място — смени го в `src/app/layout.tsx`, `src/components/Sidebar.tsx` и `src/app/login/page.tsx`.
