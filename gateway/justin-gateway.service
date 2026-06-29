@@ -1,0 +1,30 @@
+# systemd unit for the Justin gateway on the clawbox machine.
+# Install:
+#   sudo cp justin-gateway.service /etc/systemd/system/
+#   (edit User, WorkingDirectory and the PATH below to match your machine)
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now justin-gateway
+#   journalctl -u justin-gateway -f      # logs
+#
+# IMPORTANT: the claude CLI must be logged in for THIS user (run `claude`
+# once interactively as the same user and complete /login before enabling).
+
+[Unit]
+Description=Justin agent gateway (Claude CLI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clawbox
+WorkingDirectory=/home/clawbox/justin/gateway
+# Make sure node and claude are on PATH (adjust to your install locations):
+Environment=PATH=/home/clawbox/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env node src/index.js
+Restart=always
+RestartSec=3
+# Give long agent turns time to finish on stop
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

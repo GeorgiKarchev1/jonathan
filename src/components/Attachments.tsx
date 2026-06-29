@@ -8,7 +8,7 @@ import { formatBytes, relativeTime } from "@/lib/utils";
 import { Image as ImageIcon, FileText, Link2, Upload, Trash2, StickyNote, Plus } from "@/components/icons";
 
 export function Attachments({ projectId, taskId }: { projectId: ID; taskId?: ID }) {
-  const { data, addAttachment, deleteAttachment, currentUser } = useStore();
+  const { data, addAttachment, deleteAttachment, uploadFile, currentUser } = useStore();
   const fileRef = useRef<HTMLInputElement>(null);
   const [noteOpen, setNoteOpen] = useState(false);
   const [linkOpen, setLinkOpen] = useState(false);
@@ -19,24 +19,26 @@ export function Attachments({ projectId, taskId }: { projectId: ID; taskId?: ID 
   const images = items.filter((a) => a.kind === "image");
   const others = items.filter((a) => a.kind !== "image");
 
-  function onFiles(files: FileList | null) {
+  async function onFiles(files: FileList | null) {
     if (!files) return;
-    Array.from(files).forEach((file) => {
-      const reader = new FileReader();
-      reader.onload = () => {
+    for (const file of Array.from(files)) {
+      try {
+        const url = await uploadFile(file, projectId);
         addAttachment({
           projectId,
           taskId,
           kind: file.type.startsWith("image/") ? "image" : "file",
           name: file.name,
-          url: String(reader.result),
+          url,
           mime: file.type,
           size: file.size,
           uploadedBy: currentUser?.id,
         });
-      };
-      reader.readAsDataURL(file);
-    });
+      } catch (e) {
+        console.error("[attachments] upload failed:", e);
+        alert(`Качването на „${file.name}" се провали.`);
+      }
+    }
   }
 
   return (

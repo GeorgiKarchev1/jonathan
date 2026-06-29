@@ -1,0 +1,15 @@
+{
+  "name": "justin-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Justin agent gateway — drives the Claude CLI (headless, subscription auth) for the platform chat and Telegram. Read-only over the Supabase data.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/index.js",
+    "chat": "node src/cli-test.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.108.2"
+  }
+}

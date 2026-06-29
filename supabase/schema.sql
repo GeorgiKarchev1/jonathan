@@ -137,6 +137,41 @@ create table if not exists public.messages (
   created_at timestamptz not null default now()
 );
 
+-- Custom kanban columns the team adds beyond the default statuses
+create table if not exists public.board_columns (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  color text not null default '#8b5cf6',
+  "order" double precision not null default 0,
+  created_at timestamptz not null default now()
+);
+
+-- Tasks may sit in a custom board column instead of their status column
+alter table public.tasks
+  add column if not exists column_id uuid references public.board_columns(id) on delete set null;
+
+-- Feedback / feature requests from the floating widget → owner inbox
+create table if not exists public.feedback_threads (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references public.profiles(id) on delete set null,
+  user_name text not null default '',
+  user_email text,
+  kind text not null default 'feature',      -- feature | message
+  page text,
+  status text not null default 'open',        -- open | closed
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.feedback_messages (
+  id uuid primary key default gen_random_uuid(),
+  thread_id uuid references public.feedback_threads(id) on delete cascade,
+  "from" text not null,                       -- user | owner
+  text text not null,
+  image text,                                 -- optional screenshot (data URL or storage URL)
+  created_at timestamptz not null default now()
+);
+
 -- ============================================================
 -- Row Level Security — every signed-in member can read/write
 -- team data. Tighten per-org once you add organizations.
@@ -152,13 +187,17 @@ alter table public.attachments enable row level security;
 alter table public.agents enable row level security;
 alter table public.conversations enable row level security;
 alter table public.messages enable row level security;
+alter table public.board_columns enable row level security;
+alter table public.feedback_threads enable row level security;
+alter table public.feedback_messages enable row level security;
 
 do $$
 declare t text;
 begin
   foreach t in array array[
     'profiles','companies','projects','project_members',
-    'tasks','time_logs','folders','attachments','agents','conversations','messages'
+    'tasks','time_logs','folders','attachments','agents','conversations','messages',
+    'board_columns','feedback_threads','feedback_messages'
   ]
   loop
     execute format('drop policy if exists "auth read %1$s" on public.%1$I;', t);
@@ -168,12 +207,18 @@ begin
   end loop;
 end $$;
 
--- Create a profile row automatically on sign-up
+-- Create a profile row automatically on sign-up (owner email gets the owner role)
 create or replace function public.handle_new_user()
-returns trigger language plpgsql security definer as $$
+returns trigger language plpgsql security definer set search_path = ''
+as $$
 begin
-  insert into public.profiles (id, name, email)
-  values (new.id, coalesce(new.raw_user_meta_data->>'name', ''), new.email)
+  insert into public.profiles (id, name, email, role)
+  values (
+    new.id,
+    coalesce(new.raw_user_meta_data->>'name', ''),
+    new.email,
+    case when new.email = 'georgikarchev5@gmail.com' then 'owner' else 'member' end
+  )
   on conflict (id) do nothing;
   return new;
 end $$;
@@ -183,5 +228,44 @@ create trigger on_auth_user_created
   after insert on auth.users
   for each row execute function public.handle_new_user();
 
--- Storage bucket for attachments (run once):
--- insert into storage.buckets (id, name, public) values ('attachments', 'attachments', true);
+-- Auto-confirm new users so no email confirmation is required to sign in
+create or replace function public.auto_confirm_user()
+returns trigger language plpgsql security definer set search_path = ''
+as $$
+begin
+  if new.email_confirmed_at is null then
+    new.email_confirmed_at := now();
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists on_auth_user_autoconfirm on auth.users;
+create trigger on_auth_user_autoconfirm
+  before insert on auth.users
+  for each row execute function public.auto_confirm_user();
+
+-- These trigger functions are not meant to be called over the REST RPC API
+revoke execute on function public.handle_new_user() from public, anon, authenticated;
+revoke execute on function public.auto_confirm_user() from public, anon, authenticated;
+
+-- ============================================================
+-- Storage — bucket for uploaded files & photos.
+-- Files live in Supabase Storage; the DB keeps only the path.
+-- ============================================================
+insert into storage.buckets (id, name, public)
+values ('attachments', 'attachments', true)
+on conflict (id) do nothing;
+
+-- Public bucket → reads happen via the public URL, so no broad SELECT policy
+-- (that would let clients list every file). Signed-in members may write.
+drop policy if exists "auth read attachments bucket" on storage.objects;
+drop policy if exists "auth write attachments bucket" on storage.objects;
+drop policy if exists "attachments insert" on storage.objects;
+drop policy if exists "attachments update" on storage.objects;
+drop policy if exists "attachments delete" on storage.objects;
+create policy "attachments insert" on storage.objects
+  for insert to authenticated with check (bucket_id = 'attachments');
+create policy "attachments update" on storage.objects
+  for update to authenticated using (bucket_id = 'attachments') with check (bucket_id = 'attachments');
+create policy "attachments delete" on storage.objects
+  for delete to authenticated using (bucket_id = 'attachments');

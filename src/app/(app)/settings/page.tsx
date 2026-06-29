@@ -7,7 +7,7 @@ import { Avatar, Button, Field, Input, Badge } from "@/components/ui";
 import { Settings, RotateCcw, Database, Sparkles, Check, AlertCircle } from "@/components/icons";
 
 export default function SettingsPage() {
-  const { data, currentUser, updateCurrentUser, switchUser, resetDemo } = useStore();
+  const { data, currentUser, updateCurrentUser, switchUser, resetDemo, cloud } = useStore();
   const [name, setName] = useState(currentUser?.name ?? "");
   const [title, setTitle] = useState(currentUser?.title ?? "");
 
@@ -49,9 +49,9 @@ export default function SettingsPage() {
                 <Badge color={u.role === "owner" ? "var(--accent)" : undefined}>{roleLabel(u.role)}</Badge>
                 {u.id === currentUser?.id ? (
                   <span className="w-20 text-right text-xs text-[var(--green)]">текущ</span>
-                ) : (
+                ) : !cloud ? (
                   <Button size="sm" variant="ghost" onClick={() => switchUser(u.id)}>Влез като</Button>
-                )}
+                ) : null}
               </div>
             ))}
           </div>
@@ -82,14 +82,16 @@ export default function SettingsPage() {
           </p>
         </section>
 
-        {/* Danger */}
-        <section className="card border-[rgba(239,68,68,0.3)] p-6">
-          <SectionTitle className="mb-1">Изчисти данните</SectionTitle>
-          <p className="mb-4 text-sm text-[var(--muted)]">Изтрива всички проекти, фирми, задачи, агенти и заявки. Остава само твоят акаунт. Това действие е необратимо.</p>
-          <Button variant="danger" onClick={() => { if (confirm("Изтриване на всички данни?")) resetDemo(); }}>
-            <RotateCcw size={15} /> Изчисти всичко
-          </Button>
-        </section>
+        {/* Danger — demo mode only; cloud data is shared and must not be wiped from here */}
+        {!cloud && (
+          <section className="card border-[rgba(239,68,68,0.3)] p-6">
+            <SectionTitle className="mb-1">Изчисти данните</SectionTitle>
+            <p className="mb-4 text-sm text-[var(--muted)]">Изтрива всички проекти, фирми, задачи, агенти и заявки. Остава само твоят акаунт. Това действие е необратимо.</p>
+            <Button variant="danger" onClick={() => { if (confirm("Изтриване на всички данни?")) resetDemo(); }}>
+              <RotateCcw size={15} /> Изчисти всичко
+            </Button>
+          </section>
+        )}
       </div>
     </div>
   );

@@ -24,7 +24,7 @@ function sameScope(a: Scope, b: Scope) {
 }
 
 export function FileExplorer({ lockCompanyId }: { lockCompanyId?: ID }) {
-  const { data, addAttachment, deleteAttachment, addFolder, deleteFolder, renameFolder, currentUser } = useStore();
+  const { data, addAttachment, deleteAttachment, uploadFile, addFolder, deleteFolder, renameFolder, currentUser } = useStore();
   const fileRef = useRef<HTMLInputElement>(null);
 
   const [scope, setScope] = useState<Scope>(
@@ -110,24 +110,27 @@ export function FileExplorer({ lockCompanyId }: { lockCompanyId?: ID }) {
   }, [scope, data.companies, data.projects]);
 
   // ---- actions ----
-  function onFiles(files: FileList | null) {
+  async function onFiles(files: FileList | null) {
     if (!files || !newItemScope) return;
-    Array.from(files).forEach((file) => {
-      const reader = new FileReader();
-      reader.onload = () => {
+    const scopeId = newItemScope.projectId ?? newItemScope.companyId ?? "misc";
+    for (const file of Array.from(files)) {
+      try {
+        const url = await uploadFile(file, scopeId);
         addAttachment({
           ...newItemScope,
           folderId,
           kind: file.type.startsWith("image/") ? "image" : "file",
           name: file.name,
-          url: String(reader.result),
+          url,
           mime: file.type,
           size: file.size,
           uploadedBy: currentUser?.id,
         });
-      };
-      reader.readAsDataURL(file);
-    });
+      } catch (e) {
+        console.error("[files] upload failed:", e);
+        alert(`Качването на „${file.name}" се провали.`);
+      }
+    }
   }
 
   function createFolder() {

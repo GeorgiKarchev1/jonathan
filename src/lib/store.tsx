@@ -28,12 +28,36 @@ import type {
   User,
 } from "./types";
 import { buildSeed } from "./seed";
-import { uid } from "./utils";
+import { createClient, isSupabaseConfigured } from "./supabase/client";
+import { loadAll, repo } from "./supabase/repo";
 
-const STORAGE_KEY = "atlas.data.v1";
+const STORAGE_KEY = "atlas.data.v2";
 
 function nowISO() {
   return new Date().toISOString();
+}
+
+/** Stable unique id — a real UUID so the same value works in the
+ *  local store and as a Supabase primary key. */
+function newId(): ID {
+  return crypto.randomUUID();
+}
+
+/** Cloud mode starts empty; the signed-in user + team data load from Supabase. */
+function emptyData(): AppData {
+  return {
+    users: [],
+    companies: [],
+    projects: [],
+    tasks: [],
+    attachments: [],
+    folders: [],
+    agents: [],
+    boardColumns: [],
+    conversations: [],
+    feedback: [],
+    currentUserId: null,
+  };
 }
 
 /** Fill arrays added after a user's data was first saved, so older
@@ -72,11 +96,13 @@ interface StoreApi {
   data: AppData;
   ready: boolean;
   currentUser: User | null;
+  /** true when wired to Supabase (shared cloud data), false in local demo mode */
+  cloud: boolean;
 
-  // auth (demo)
-  login: (email: string) => boolean;
-  signup: (name: string, email: string) => User;
-  logout: () => void;
+  // auth
+  login: (email: string, password?: string) => Promise<boolean>;
+  signup: (name: string, email: string, password?: string) => Promise<User | null>;
+  logout: () => Promise<void>;
   switchUser: (id: ID) => void;
   updateCurrentUser: (patch: Partial<User>) => void;
 
@@ -100,6 +126,8 @@ interface StoreApi {
   // attachments
   addAttachment: (input: Partial<Attachment> & { name: string; kind: Attachment["kind"] }) => Attachment;
   deleteAttachment: (id: ID) => void;
+  /** upload a real file/photo to cloud storage (when configured), else returns a local data URL */
+  uploadFile: (file: File, scope?: string) => Promise<string>;
 
   // folders (file system)
   addFolder: (input: Partial<Folder> & { name: string }) => Folder;
@@ -133,281 +161,448 @@ interface StoreApi {
 const StoreContext = createContext<StoreApi | null>(null);
 
 export function StoreProvider({ children }: { children: React.ReactNode }) {
-  const [data, setData] = useState<AppData>(() => buildSeed());
+  const supabase = useMemo(() => createClient(), []);
+  const cloud = !!supabase;
+
+  const [data, setData] = useState<AppData>(() => (isSupabaseConfigured ? emptyData() : buildSeed()));
   const [ready, setReady] = useState(false);
   const hydrated = useRef(false);
 
-  // hydrate from localStorage on mount
+  // mirror latest state so mutation handlers can read it without re-creating callbacks
+  const dataRef = useRef(data);
   useEffect(() => {
-    setData(load());
-    setReady(true);
-    hydrated.current = true;
-  }, []);
+    dataRef.current = data;
+  }, [data]);
 
-  // persist
+  /** fire-and-forget write to Supabase (cloud mode only); logs failures */
+  const remote = useCallback(
+    (fn: (db: NonNullable<typeof supabase>) => Promise<unknown> | unknown) => {
+      if (!supabase) return;
+      Promise.resolve(fn(supabase)).catch((e) => console.error("[store] remote write failed:", e));
+    },
+    [supabase]
+  );
+
+  // ---- initial load ----
   useEffect(() => {
-    if (!hydrated.current) return;
+    let active = true;
+
+    if (!supabase) {
+      // local demo mode
+      setData(load());
+      setReady(true);
+      hydrated.current = true;
+      return;
+    }
+
+    async function hydrateFromCloud(userId: string | null) {
+      if (!userId) {
+        if (active) {
+          setData(emptyData());
+          setReady(true);
+        }
+        return;
+      }
+      try {
+        const loaded = await loadAll(supabase!);
+        if (active) setData({ ...loaded, currentUserId: userId });
+      } catch (e) {
+        console.error("[store] cloud load failed:", e);
+        if (active) setData((d) => ({ ...d, currentUserId: userId }));
+      } finally {
+        if (active) setReady(true);
+      }
+    }
+
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      hydrateFromCloud(session?.user.id ?? null);
+    });
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      hydrateFromCloud(session?.user.id ?? null);
+    });
+
+    return () => {
+      active = false;
+      sub.subscription.unsubscribe();
+    };
+  }, [supabase]);
+
+  // persist to localStorage in demo mode only
+  useEffect(() => {
+    if (!hydrated.current || cloud) return;
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
     } catch {
       /* ignore quota errors */
     }
-  }, [data]);
+  }, [data, cloud]);
 
   const currentUser = useMemo(
     () => data.users.find((u) => u.id === data.currentUserId) ?? null,
     [data.users, data.currentUserId]
   );
 
-  // ---- auth (demo) ----
-  const login = useCallback((email: string) => {
-    let ok = false;
-    setData((d) => {
-      const user = d.users.find((u) => u.email.toLowerCase() === email.toLowerCase());
-      if (!user) return d;
-      ok = true;
-      return { ...d, currentUserId: user.id };
-    });
-    return ok;
-  }, []);
+  const meId = useCallback(() => dataRef.current.currentUserId ?? "u_ivan", []);
 
-  const signup = useCallback((name: string, email: string) => {
-    const colors = ["#8b5cf6", "#ec4899", "#3b82f6", "#22c55e", "#f59e0b"];
-    const user: User = {
-      id: uid("u"),
-      name,
-      email,
-      role: "member",
-      color: colors[name.length % colors.length],
-    };
-    setData((d) => ({ ...d, users: [...d.users, user], currentUserId: user.id }));
-    return user;
-  }, []);
+  // ---- auth ----
+  const login = useCallback(
+    async (email: string, password?: string) => {
+      if (supabase) {
+        const { error } = await supabase.auth.signInWithPassword({ email, password: password ?? "" });
+        return !error;
+      }
+      // demo
+      let ok = false;
+      setData((d) => {
+        const user = d.users.find((u) => u.email.toLowerCase() === email.toLowerCase());
+        if (!user) return d;
+        ok = true;
+        return { ...d, currentUserId: user.id };
+      });
+      return ok;
+    },
+    [supabase]
+  );
 
-  const logout = useCallback(() => setData((d) => ({ ...d, currentUserId: null })), []);
+  const signup = useCallback(
+    async (name: string, email: string, password?: string) => {
+      if (supabase) {
+        const { data: res, error } = await supabase.auth.signUp({
+          email,
+          password: password ?? "",
+          options: { data: { name } },
+        });
+        if (error || !res.user) {
+          console.error("[store] signup failed:", error);
+          return null;
+        }
+        return { id: res.user.id, name, email, role: "member", color: "#8b5cf6" } as User;
+      }
+      // demo
+      const colors = ["#8b5cf6", "#ec4899", "#3b82f6", "#22c55e", "#f59e0b"];
+      const user: User = { id: newId(), name, email, role: "member", color: colors[name.length % colors.length] };
+      setData((d) => ({ ...d, users: [...d.users, user], currentUserId: user.id }));
+      return user;
+    },
+    [supabase]
+  );
+
+  const logout = useCallback(async () => {
+    if (supabase) await supabase.auth.signOut();
+    setData((d) => ({ ...d, currentUserId: null }));
+  }, [supabase]);
+
   const switchUser = useCallback((id: ID) => setData((d) => ({ ...d, currentUserId: id })), []);
 
-  const updateCurrentUser = useCallback((patch: Partial<User>) => {
-    setData((d) => ({
-      ...d,
-      users: d.users.map((u) => (u.id === d.currentUserId ? { ...u, ...patch } : u)),
-    }));
-  }, []);
+  const updateCurrentUser = useCallback(
+    (patch: Partial<User>) => {
+      setData((d) => {
+        const users = d.users.map((u) => (u.id === d.currentUserId ? { ...u, ...patch } : u));
+        const me = users.find((u) => u.id === d.currentUserId);
+        if (me) remote((db) => repo.saveProfile(db, me));
+        return { ...d, users };
+      });
+    },
+    [remote]
+  );
 
   // ---- companies ----
-  const addCompany = useCallback((input: Partial<Company> & { name: string }) => {
-    const company: Company = {
-      id: uid("c"),
-      createdAt: nowISO(),
-      ...input,
-    };
-    setData((d) => ({ ...d, companies: [company, ...d.companies] }));
-    return company;
-  }, []);
+  const addCompany = useCallback(
+    (input: Partial<Company> & { name: string }) => {
+      const company: Company = { id: newId(), createdAt: nowISO(), ...input };
+      setData((d) => ({ ...d, companies: [company, ...d.companies] }));
+      remote((db) => repo.saveCompany(db, company));
+      return company;
+    },
+    [remote]
+  );
 
-  const updateCompany = useCallback((id: ID, patch: Partial<Company>) => {
-    setData((d) => ({ ...d, companies: d.companies.map((c) => (c.id === id ? { ...c, ...patch } : c)) }));
-  }, []);
+  const updateCompany = useCallback(
+    (id: ID, patch: Partial<Company>) => {
+      const updated = { ...dataRef.current.companies.find((c) => c.id === id), ...patch } as Company;
+      setData((d) => ({ ...d, companies: d.companies.map((c) => (c.id === id ? { ...c, ...patch } : c)) }));
+      if (updated.id) remote((db) => repo.saveCompany(db, updated));
+    },
+    [remote]
+  );
 
-  const deleteCompany = useCallback((id: ID) => {
-    setData((d) => ({
-      ...d,
-      companies: d.companies.filter((c) => c.id !== id),
-      projects: d.projects.map((p) => (p.companyId === id ? { ...p, companyId: undefined } : p)),
-      agents: d.agents.map((a) => (a.companyId === id ? { ...a, companyId: undefined } : a)),
-      // remove client-level files & folders (project-level ones stay with their project)
-      folders: d.folders.filter((f) => !(f.companyId === id && !f.projectId)),
-      attachments: d.attachments.filter((a) => !(a.companyId === id && !a.projectId)),
-    }));
-  }, []);
+  const deleteCompany = useCallback(
+    (id: ID) => {
+      setData((d) => ({
+        ...d,
+        companies: d.companies.filter((c) => c.id !== id),
+        projects: d.projects.map((p) => (p.companyId === id ? { ...p, companyId: undefined } : p)),
+        agents: d.agents.map((a) => (a.companyId === id ? { ...a, companyId: undefined } : a)),
+        folders: d.folders.filter((f) => !(f.companyId === id && !f.projectId)),
+        attachments: d.attachments.filter((a) => !(a.companyId === id && !a.projectId)),
+      }));
+      remote((db) => repo.deleteCompany(db, id));
+    },
+    [remote]
+  );
 
   // ---- projects ----
-  const addProject = useCallback((input: Partial<Project> & { name: string }) => {
-    const colors = ["#8b5cf6", "#ec4899", "#3b82f6", "#22c55e", "#f59e0b"];
-    const project: Project = {
-      id: uid("p"),
-      status: "planning",
-      color: colors[input.name.length % colors.length],
-      ownerId: input.ownerId ?? "u_ivan",
-      memberIds: input.memberIds ?? [],
-      createdAt: nowISO(),
-      ...input,
-    };
-    setData((d) => ({ ...d, projects: [project, ...d.projects] }));
-    return project;
-  }, []);
+  const addProject = useCallback(
+    (input: Partial<Project> & { name: string }) => {
+      const colors = ["#8b5cf6", "#ec4899", "#3b82f6", "#22c55e", "#f59e0b"];
+      const project: Project = {
+        id: newId(),
+        status: "planning",
+        color: colors[input.name.length % colors.length],
+        ownerId: input.ownerId ?? meId(),
+        memberIds: input.memberIds ?? [],
+        createdAt: nowISO(),
+        ...input,
+      };
+      setData((d) => ({ ...d, projects: [project, ...d.projects] }));
+      remote((db) => repo.saveProject(db, project));
+      return project;
+    },
+    [remote, meId]
+  );
 
-  const updateProject = useCallback((id: ID, patch: Partial<Project>) => {
-    setData((d) => ({ ...d, projects: d.projects.map((p) => (p.id === id ? { ...p, ...patch } : p)) }));
-  }, []);
+  const updateProject = useCallback(
+    (id: ID, patch: Partial<Project>) => {
+      const updated = { ...dataRef.current.projects.find((p) => p.id === id), ...patch } as Project;
+      setData((d) => ({ ...d, projects: d.projects.map((p) => (p.id === id ? { ...p, ...patch } : p)) }));
+      if (updated.id) remote((db) => repo.saveProject(db, updated));
+    },
+    [remote]
+  );
 
-  const deleteProject = useCallback((id: ID) => {
-    setData((d) => ({
-      ...d,
-      projects: d.projects.filter((p) => p.id !== id),
-      tasks: d.tasks.filter((t) => t.projectId !== id),
-      attachments: d.attachments.filter((a) => a.projectId !== id),
-      folders: d.folders.filter((f) => f.projectId !== id),
-      agents: d.agents.map((a) => (a.projectId === id ? { ...a, projectId: undefined } : a)),
-      conversations: d.conversations.filter((c) => c.projectId !== id),
-    }));
-  }, []);
+  const deleteProject = useCallback(
+    (id: ID) => {
+      setData((d) => ({
+        ...d,
+        projects: d.projects.filter((p) => p.id !== id),
+        tasks: d.tasks.filter((t) => t.projectId !== id),
+        attachments: d.attachments.filter((a) => a.projectId !== id),
+        folders: d.folders.filter((f) => f.projectId !== id),
+        agents: d.agents.map((a) => (a.projectId === id ? { ...a, projectId: undefined } : a)),
+        conversations: d.conversations.filter((c) => c.projectId !== id),
+      }));
+      remote((db) => repo.deleteProject(db, id));
+    },
+    [remote]
+  );
 
   // ---- tasks ----
-  const addTask = useCallback((input: Partial<Task> & { projectId: ID; title: string }) => {
-    const task: Task = {
-      id: uid("t"),
-      status: "todo",
-      priority: "medium",
-      timeLogs: [],
-      createdAt: nowISO(),
-      order: Date.now(),
-      ...input,
-    };
-    setData((d) => ({ ...d, tasks: [...d.tasks, task] }));
-    return task;
-  }, []);
+  const addTask = useCallback(
+    (input: Partial<Task> & { projectId: ID; title: string }) => {
+      const task: Task = {
+        id: newId(),
+        status: "todo",
+        priority: "medium",
+        timeLogs: [],
+        createdAt: nowISO(),
+        order: Date.now(),
+        ...input,
+      };
+      setData((d) => ({ ...d, tasks: [...d.tasks, task] }));
+      remote((db) => repo.saveTask(db, task));
+      return task;
+    },
+    [remote]
+  );
 
-  const updateTask = useCallback((id: ID, patch: Partial<Task>) => {
-    setData((d) => ({
-      ...d,
-      tasks: d.tasks.map((t) => {
-        if (t.id !== id) return t;
-        const next = { ...t, ...patch };
-        if (patch.status === "done" && t.status !== "done") next.completedAt = nowISO();
-        if (patch.status && patch.status !== "done") next.completedAt = undefined;
-        return next;
-      }),
-    }));
-  }, []);
+  const updateTask = useCallback(
+    (id: ID, patch: Partial<Task>) => {
+      const prev = dataRef.current.tasks.find((t) => t.id === id);
+      if (!prev) return;
+      const next: Task = { ...prev, ...patch };
+      if (patch.status === "done" && prev.status !== "done") next.completedAt = nowISO();
+      if (patch.status && patch.status !== "done") next.completedAt = undefined;
+      setData((d) => ({ ...d, tasks: d.tasks.map((t) => (t.id === id ? next : t)) }));
+      remote((db) => repo.saveTask(db, next));
+    },
+    [remote]
+  );
 
-  const moveTask = useCallback((id: ID, status: TaskStatus) => {
-    updateTask(id, { status, columnId: undefined });
-  }, [updateTask]);
+  const moveTask = useCallback(
+    (id: ID, status: TaskStatus) => {
+      updateTask(id, { status, columnId: undefined });
+    },
+    [updateTask]
+  );
 
-  const deleteTask = useCallback((id: ID) => {
-    setData((d) => ({
-      ...d,
-      tasks: d.tasks.filter((t) => t.id !== id),
-      attachments: d.attachments.filter((a) => a.taskId !== id),
-    }));
-  }, []);
+  const deleteTask = useCallback(
+    (id: ID) => {
+      setData((d) => ({
+        ...d,
+        tasks: d.tasks.filter((t) => t.id !== id),
+        attachments: d.attachments.filter((a) => a.taskId !== id),
+      }));
+      remote((db) => repo.deleteTask(db, id));
+    },
+    [remote]
+  );
 
-  const addTimeLog = useCallback((taskId: ID, log: Partial<TimeLog> & { userId: ID; startDate: string }) => {
-    const entry: TimeLog = { id: uid("tl"), ...log };
-    setData((d) => ({
-      ...d,
-      tasks: d.tasks.map((t) => (t.id === taskId ? { ...t, timeLogs: [...t.timeLogs, entry] } : t)),
-    }));
-  }, []);
+  const addTimeLog = useCallback(
+    (taskId: ID, log: Partial<TimeLog> & { userId: ID; startDate: string }) => {
+      const entry: TimeLog = { id: newId(), ...log };
+      setData((d) => ({
+        ...d,
+        tasks: d.tasks.map((t) => (t.id === taskId ? { ...t, timeLogs: [...t.timeLogs, entry] } : t)),
+      }));
+      remote((db) => repo.saveTimeLog(db, taskId, entry));
+    },
+    [remote]
+  );
 
   // ---- attachments ----
   const addAttachment = useCallback(
     (input: Partial<Attachment> & { name: string; kind: Attachment["kind"] }) => {
-      const att: Attachment = {
-        id: uid("a"),
-        uploadedBy: "u_ivan",
-        createdAt: nowISO(),
-        ...input,
-      };
+      const att: Attachment = { id: newId(), uploadedBy: meId(), createdAt: nowISO(), ...input };
       setData((d) => ({ ...d, attachments: [att, ...d.attachments] }));
+      remote((db) => repo.saveAttachment(db, att));
       return att;
     },
-    []
+    [remote, meId]
   );
 
-  const deleteAttachment = useCallback((id: ID) => {
-    setData((d) => ({ ...d, attachments: d.attachments.filter((a) => a.id !== id) }));
-  }, []);
+  const deleteAttachment = useCallback(
+    (id: ID) => {
+      setData((d) => ({ ...d, attachments: d.attachments.filter((a) => a.id !== id) }));
+      remote((db) => repo.deleteAttachment(db, id));
+    },
+    [remote]
+  );
+
+  const uploadFile = useCallback(
+    async (file: File, scope = "misc") => {
+      if (supabase) {
+        const { url } = await repo.uploadFile(supabase, file, scope);
+        return url;
+      }
+      // demo: base64 data URL
+      return await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.readAsDataURL(file);
+      });
+    },
+    [supabase]
+  );
 
   // ---- folders (file system) ----
-  const addFolder = useCallback((input: Partial<Folder> & { name: string }) => {
-    const folder: Folder = { id: uid("f"), createdAt: nowISO(), ...input };
-    setData((d) => ({ ...d, folders: [...d.folders, folder] }));
-    return folder;
-  }, []);
+  const addFolder = useCallback(
+    (input: Partial<Folder> & { name: string }) => {
+      const folder: Folder = { id: newId(), createdAt: nowISO(), ...input };
+      setData((d) => ({ ...d, folders: [...d.folders, folder] }));
+      remote((db) => repo.saveFolder(db, folder));
+      return folder;
+    },
+    [remote]
+  );
 
-  const renameFolder = useCallback((id: ID, name: string) => {
-    setData((d) => ({ ...d, folders: d.folders.map((f) => (f.id === id ? { ...f, name } : f)) }));
-  }, []);
+  const renameFolder = useCallback(
+    (id: ID, name: string) => {
+      const updated = { ...dataRef.current.folders.find((f) => f.id === id), name } as Folder;
+      setData((d) => ({ ...d, folders: d.folders.map((f) => (f.id === id ? { ...f, name } : f)) }));
+      if (updated.id) remote((db) => repo.saveFolder(db, updated));
+    },
+    [remote]
+  );
 
-  const deleteFolder = useCallback((id: ID) => {
-    setData((d) => {
-      // collect the folder and any nested children
+  const deleteFolder = useCallback(
+    (id: ID) => {
       const doomed = new Set<ID>([id]);
       let grew = true;
       while (grew) {
         grew = false;
-        for (const f of d.folders) {
+        for (const f of dataRef.current.folders) {
           if (f.parentId && doomed.has(f.parentId) && !doomed.has(f.id)) {
             doomed.add(f.id);
             grew = true;
           }
         }
       }
-      return {
+      setData((d) => ({
         ...d,
         folders: d.folders.filter((f) => !doomed.has(f.id)),
-        // files inside a removed folder fall back to the folder's scope (folderId cleared)
         attachments: d.attachments.map((a) => (a.folderId && doomed.has(a.folderId) ? { ...a, folderId: undefined } : a)),
-      };
-    });
-  }, []);
+      }));
+      // delete the whole subtree (DB FK clears attachment.folder_id automatically)
+      doomed.forEach((fid) => remote((db) => repo.deleteFolder(db, fid)));
+    },
+    [remote]
+  );
 
   // ---- agents ----
-  const addAgent = useCallback((input: Partial<Agent> & { name: string }) => {
-    const colors = ["#8b5cf6", "#ec4899", "#3b82f6", "#22c55e", "#f59e0b"];
-    const agent: Agent = {
-      id: uid("ag"),
-      model: "Claude Opus 4.8",
-      color: colors[input.name.length % colors.length],
-      skills: [],
-      status: "active",
-      createdAt: nowISO(),
-      ...input,
-    };
-    setData((d) => ({ ...d, agents: [agent, ...d.agents] }));
-    return agent;
-  }, []);
+  const addAgent = useCallback(
+    (input: Partial<Agent> & { name: string }) => {
+      const colors = ["#8b5cf6", "#ec4899", "#3b82f6", "#22c55e", "#f59e0b"];
+      const agent: Agent = {
+        id: newId(),
+        model: "Claude Opus 4.8",
+        color: colors[input.name.length % colors.length],
+        skills: [],
+        status: "active",
+        createdAt: nowISO(),
+        ...input,
+      };
+      setData((d) => ({ ...d, agents: [agent, ...d.agents] }));
+      remote((db) => repo.saveAgent(db, agent));
+      return agent;
+    },
+    [remote]
+  );
 
-  const updateAgent = useCallback((id: ID, patch: Partial<Agent>) => {
-    setData((d) => ({ ...d, agents: d.agents.map((a) => (a.id === id ? { ...a, ...patch } : a)) }));
-  }, []);
+  const updateAgent = useCallback(
+    (id: ID, patch: Partial<Agent>) => {
+      const updated = { ...dataRef.current.agents.find((a) => a.id === id), ...patch } as Agent;
+      setData((d) => ({ ...d, agents: d.agents.map((a) => (a.id === id ? { ...a, ...patch } : a)) }));
+      if (updated.id) remote((db) => repo.saveAgent(db, updated));
+    },
+    [remote]
+  );
 
-  const deleteAgent = useCallback((id: ID) => {
-    setData((d) => ({
-      ...d,
-      agents: d.agents.filter((a) => a.id !== id),
-      conversations: d.conversations.map((c) => (c.agentId === id ? { ...c, agentId: undefined } : c)),
-    }));
-  }, []);
+  const deleteAgent = useCallback(
+    (id: ID) => {
+      setData((d) => ({
+        ...d,
+        agents: d.agents.filter((a) => a.id !== id),
+        conversations: d.conversations.map((c) => (c.agentId === id ? { ...c, agentId: undefined } : c)),
+      }));
+      remote((db) => repo.deleteAgent(db, id));
+    },
+    [remote]
+  );
 
   // ---- custom board columns ----
-  const addBoardColumn = useCallback((name: string) => {
-    const colors = ["#8b5cf6", "#ec4899", "#06b6d4", "#f59e0b", "#a855f7", "#ef4444"];
-    const column: BoardColumn = { id: uid("col"), name, color: colors[name.length % colors.length] };
-    setData((d) => ({ ...d, boardColumns: [...d.boardColumns, column] }));
-    return column;
-  }, []);
+  const addBoardColumn = useCallback(
+    (name: string) => {
+      const colors = ["#8b5cf6", "#ec4899", "#06b6d4", "#f59e0b", "#a855f7", "#ef4444"];
+      const column: BoardColumn = { id: newId(), name, color: colors[name.length % colors.length] };
+      setData((d) => ({ ...d, boardColumns: [...d.boardColumns, column] }));
+      remote((db) => repo.saveBoardColumn(db, column));
+      return column;
+    },
+    [remote]
+  );
 
-  const deleteBoardColumn = useCallback((id: ID) => {
-    setData((d) => ({
-      ...d,
-      boardColumns: d.boardColumns.filter((c) => c.id !== id),
-      // tasks fall back to their status column
-      tasks: d.tasks.map((t) => (t.columnId === id ? { ...t, columnId: undefined } : t)),
-    }));
-  }, []);
+  const deleteBoardColumn = useCallback(
+    (id: ID) => {
+      setData((d) => ({
+        ...d,
+        boardColumns: d.boardColumns.filter((c) => c.id !== id),
+        tasks: d.tasks.map((t) => (t.columnId === id ? { ...t, columnId: undefined } : t)),
+      }));
+      remote((db) => repo.deleteBoardColumn(db, id));
+    },
+    [remote]
+  );
 
   // ---- feedback ----
-  // Each submission is its own item (so a feature request is a discrete to-do).
-  const submitFeedback = useCallback((input: { text: string; image?: string; page?: string; kind?: FeedbackThread["kind"] }) => {
-    setData((d) => {
-      const user = d.users.find((u) => u.id === d.currentUserId);
-      const msg: FeedbackMessage = { id: uid("fm"), from: "user", text: input.text, image: input.image, createdAt: nowISO() };
+  const submitFeedback = useCallback(
+    (input: { text: string; image?: string; page?: string; kind?: FeedbackThread["kind"] }) => {
+      const d0 = dataRef.current;
+      const user = d0.users.find((u) => u.id === d0.currentUserId);
+      const msg: FeedbackMessage = { id: newId(), from: "user", text: input.text, image: input.image, createdAt: nowISO() };
       const thread: FeedbackThread = {
-        id: uid("fb"),
-        userId: d.currentUserId ?? undefined,
+        id: newId(),
+        userId: d0.currentUserId ?? undefined,
         userName: user?.name ?? "Гост",
         userEmail: user?.email,
         kind: input.kind ?? "feature",
@@ -417,83 +612,122 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         createdAt: nowISO(),
         updatedAt: nowISO(),
       };
-      return { ...d, feedback: [thread, ...d.feedback] };
-    });
-  }, []);
+      setData((d) => ({ ...d, feedback: [thread, ...d.feedback] }));
+      remote(async (db) => {
+        await repo.saveFeedbackThread(db, thread);
+        await repo.insertFeedbackMessage(db, thread.id, msg);
+      });
+    },
+    [remote]
+  );
 
-  const replyFeedback = useCallback((threadId: ID, input: { text: string; image?: string }) => {
-    const msg: FeedbackMessage = { id: uid("fm"), from: "owner", text: input.text, image: input.image, createdAt: nowISO() };
-    setData((d) => ({
-      ...d,
-      feedback: d.feedback.map((f) => (f.id === threadId ? { ...f, messages: [...f.messages, msg], updatedAt: nowISO() } : f)),
-    }));
-  }, []);
+  const replyFeedback = useCallback(
+    (threadId: ID, input: { text: string; image?: string }) => {
+      const msg: FeedbackMessage = { id: newId(), from: "owner", text: input.text, image: input.image, createdAt: nowISO() };
+      const ts = nowISO();
+      setData((d) => ({
+        ...d,
+        feedback: d.feedback.map((f) => (f.id === threadId ? { ...f, messages: [...f.messages, msg], updatedAt: ts } : f)),
+      }));
+      remote(async (db) => {
+        await repo.insertFeedbackMessage(db, threadId, msg);
+        await repo.touchFeedbackThread(db, threadId, { updatedAt: ts });
+      });
+    },
+    [remote]
+  );
 
-  const setFeedbackStatus = useCallback((threadId: ID, status: FeedbackThread["status"]) => {
-    setData((d) => ({ ...d, feedback: d.feedback.map((f) => (f.id === threadId ? { ...f, status, updatedAt: nowISO() } : f)) }));
-  }, []);
+  const setFeedbackStatus = useCallback(
+    (threadId: ID, status: FeedbackThread["status"]) => {
+      const ts = nowISO();
+      setData((d) => ({ ...d, feedback: d.feedback.map((f) => (f.id === threadId ? { ...f, status, updatedAt: ts } : f)) }));
+      remote((db) => repo.touchFeedbackThread(db, threadId, { status, updatedAt: ts }));
+    },
+    [remote]
+  );
 
-  const deleteFeedbackThread = useCallback((id: ID) => {
-    setData((d) => ({ ...d, feedback: d.feedback.filter((f) => f.id !== id) }));
-  }, []);
+  const deleteFeedbackThread = useCallback(
+    (id: ID) => {
+      setData((d) => ({ ...d, feedback: d.feedback.filter((f) => f.id !== id) }));
+      remote((db) => repo.deleteFeedbackThread(db, id));
+    },
+    [remote]
+  );
 
   // ---- conversations ----
-  const addConversation = useCallback((input?: Partial<Conversation>) => {
-    const conv: Conversation = {
-      id: uid("conv"),
-      title: input?.title ?? "Нов чат",
-      projectId: input?.projectId,
-      taskId: input?.taskId,
-      agentId: input?.agentId,
-      messages: input?.messages ?? [],
-      createdAt: nowISO(),
-      updatedAt: nowISO(),
-    };
-    setData((d) => ({ ...d, conversations: [conv, ...d.conversations] }));
-    return conv;
-  }, []);
+  const addConversation = useCallback(
+    (input?: Partial<Conversation>) => {
+      const conv: Conversation = {
+        id: newId(),
+        title: input?.title ?? "Нов чат",
+        projectId: input?.projectId,
+        taskId: input?.taskId,
+        agentId: input?.agentId,
+        messages: input?.messages ?? [],
+        createdAt: nowISO(),
+        updatedAt: nowISO(),
+      };
+      setData((d) => ({ ...d, conversations: [conv, ...d.conversations] }));
+      remote((db) => repo.saveConversation(db, conv));
+      return conv;
+    },
+    [remote]
+  );
 
-  const updateConversation = useCallback((id: ID, patch: Partial<Conversation>) => {
-    setData((d) => ({
-      ...d,
-      conversations: d.conversations.map((c) => (c.id === id ? { ...c, ...patch, updatedAt: nowISO() } : c)),
-    }));
-  }, []);
+  const updateConversation = useCallback(
+    (id: ID, patch: Partial<Conversation>) => {
+      const updated = { ...dataRef.current.conversations.find((c) => c.id === id), ...patch, updatedAt: nowISO() } as Conversation;
+      setData((d) => ({
+        ...d,
+        conversations: d.conversations.map((c) => (c.id === id ? { ...c, ...patch, updatedAt: updated.updatedAt } : c)),
+      }));
+      if (updated.id) remote((db) => repo.saveConversation(db, updated));
+    },
+    [remote]
+  );
 
-  const addMessage = useCallback((convId: ID, msg: Omit<ChatMessage, "id" | "createdAt"> & { id?: ID }) => {
-    const message: ChatMessage = { id: msg.id ?? uid("m"), createdAt: nowISO(), ...msg };
-    setData((d) => ({
-      ...d,
-      conversations: d.conversations.map((c) =>
-        c.id === convId
-          ? {
-              ...c,
-              messages: [...c.messages, message],
-              updatedAt: nowISO(),
-              title:
-                c.messages.length === 0 && msg.role === "user"
-                  ? msg.content.slice(0, 40)
-                  : c.title,
-            }
-          : c
-      ),
-    }));
-    return message;
-  }, []);
+  const addMessage = useCallback(
+    (convId: ID, msg: Omit<ChatMessage, "id" | "createdAt"> & { id?: ID }) => {
+      const message: ChatMessage = { id: msg.id ?? newId(), createdAt: nowISO(), ...msg };
+      const conv = dataRef.current.conversations.find((c) => c.id === convId);
+      const newTitle =
+        conv && conv.messages.length === 0 && msg.role === "user" ? msg.content.slice(0, 40) : conv?.title;
+      const ts = nowISO();
+      setData((d) => ({
+        ...d,
+        conversations: d.conversations.map((c) =>
+          c.id === convId
+            ? { ...c, messages: [...c.messages, message], updatedAt: ts, title: newTitle ?? c.title }
+            : c
+        ),
+      }));
+      remote(async (db) => {
+        await repo.insertMessage(db, convId, message);
+        if (conv) await repo.saveConversation(db, { ...conv, title: newTitle ?? conv.title, updatedAt: ts, messages: [] });
+      });
+      return message;
+    },
+    [remote]
+  );
 
-  const deleteConversation = useCallback((id: ID) => {
-    setData((d) => ({ ...d, conversations: d.conversations.filter((c) => c.id !== id) }));
-  }, []);
+  const deleteConversation = useCallback(
+    (id: ID) => {
+      setData((d) => ({ ...d, conversations: d.conversations.filter((c) => c.id !== id) }));
+      remote((db) => repo.deleteConversation(db, id));
+    },
+    [remote]
+  );
 
   const resetDemo = useCallback(() => {
-    const seed = buildSeed();
-    setData(seed);
-  }, []);
+    if (cloud) return; // cloud data is the source of truth; nothing to reset
+    setData(buildSeed());
+  }, [cloud]);
 
   const api: StoreApi = {
     data,
     ready,
     currentUser,
+    cloud,
     login,
     signup,
     logout,
@@ -512,6 +746,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     addTimeLog,
     addAttachment,
     deleteAttachment,
+    uploadFile,
     addFolder,
     renameFolder,
     deleteFolder,

@@ -8,29 +8,44 @@ import { Sparkles, ArrowRight } from "@/components/icons";
 import { HeroScene } from "@/components/motion";
 
 export default function LoginPage() {
-  const { ready, currentUser, data, login, signup } = useStore();
+  const { ready, currentUser, data, login, signup, cloud } = useStore();
   const router = useRouter();
   const [mode, setMode] = useState<"login" | "signup">("login");
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
+  const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (ready && currentUser) router.replace("/dashboard");
   }, [ready, currentUser, router]);
 
-  function handleLogin(e: React.FormEvent) {
+  async function handleLogin(e: React.FormEvent) {
     e.preventDefault();
     setError("");
-    if (login(email)) router.replace("/dashboard");
-    else setError("Няма акаунт с този имейл. Опитай демо акаунт или се регистрирай.");
+    setBusy(true);
+    const ok = await login(email, password);
+    setBusy(false);
+    if (ok) router.replace("/dashboard");
+    else setError(cloud ? "Грешен имейл или парола." : "Няма акаунт с този имейл. Опитай демо акаунт или се регистрирай.");
   }
 
-  function handleSignup(e: React.FormEvent) {
+  async function handleSignup(e: React.FormEvent) {
     e.preventDefault();
     if (!name.trim() || !email.trim()) return;
-    signup(name.trim(), email.trim());
-    router.replace("/dashboard");
+    if (cloud && password.length < 6) { setError("Паролата трябва да е поне 6 знака."); return; }
+    setError("");
+    setBusy(true);
+    const user = await signup(name.trim(), email.trim(), password);
+    setBusy(false);
+    if (!user) { setError("Регистрацията се провали. Възможно е имейлът вече да е зает."); return; }
+    if (cloud) {
+      setMode("login");
+      setError("Профилът е създаден. Влез с имейл и парола (може да е нужно потвърждение по имейл).");
+    } else {
+      router.replace("/dashboard");
+    }
   }
 
   return (
@@ -98,9 +113,14 @@ export default function LoginPage() {
                   autoFocus
                 />
               </Field>
+              {cloud && (
+                <Field label="Парола">
+                  <Input type="password" placeholder="••••••••" value={password} onChange={(e) => setPassword(e.target.value)} />
+                </Field>
+              )}
               {error && <p className="text-sm text-[var(--red)]">{error}</p>}
-              <Button type="submit" variant="primary" size="lg" className="w-full">
-                Влез <ArrowRight size={16} />
+              <Button type="submit" variant="primary" size="lg" className="w-full" disabled={busy}>
+                {busy ? "Влизане…" : <>Влез <ArrowRight size={16} /></>}
               </Button>
             </form>
           ) : (
@@ -111,8 +131,14 @@ export default function LoginPage() {
               <Field label="Имейл">
                 <Input type="email" placeholder="ti@firma.bg" value={email} onChange={(e) => setEmail(e.target.value)} />
               </Field>
-              <Button type="submit" variant="primary" size="lg" className="w-full">
-                Създай акаунт <ArrowRight size={16} />
+              {cloud && (
+                <Field label="Парола">
+                  <Input type="password" placeholder="поне 6 знака" value={password} onChange={(e) => setPassword(e.target.value)} />
+                </Field>
+              )}
+              {error && <p className="text-sm text-[var(--red)]">{error}</p>}
+              <Button type="submit" variant="primary" size="lg" className="w-full" disabled={busy}>
+                {busy ? "Създаване…" : <>Създай акаунт <ArrowRight size={16} /></>}
               </Button>
             </form>
           )}
@@ -127,7 +153,8 @@ export default function LoginPage() {
             {mode === "login" ? "Нямаш акаунт? Регистрирай се" : "Вече имаш акаунт? Влез"}
           </button>
 
-          {/* Demo quick-login */}
+          {/* Demo quick-login — only in local demo mode */}
+          {!cloud && (
           <div className="mt-9">
             <div className="flex items-center gap-3 text-xs text-[var(--muted-2)]">
               <span className="h-px flex-1 bg-[var(--border)]" /> или влез като демо потребител{" "}
@@ -152,6 +179,7 @@ export default function LoginPage() {
               ))}
             </div>
           </div>
+          )}
         </div>
       </div>
     </div>
