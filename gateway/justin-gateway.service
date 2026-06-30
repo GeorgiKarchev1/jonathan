@@ -20,6 +20,9 @@ User=clawbox
 WorkingDirectory=/home/clawbox/justin/gateway
 # Make sure node and claude are on PATH (adjust to your install locations):
 Environment=PATH=/home/clawbox/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Claude Max OAuth token (from `claude setup-token`). Either set it here or in
+# gateway/.env. Subscription auth, no API key:
+#Environment=CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
 ExecStart=/usr/bin/env node src/index.js
 Restart=always
 RestartSec=3
