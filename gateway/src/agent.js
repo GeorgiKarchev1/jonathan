@@ -1,5 +1,7 @@
 // Composes the "Justin" agent: persona + a fresh workspace snapshot, with
-// per-conversation session continuity. Read-only phase.
+// per-conversation session continuity. Supports images / vision through
+// Claude CLI's ability to fetch image URLs in -p mode.
+// Supports progress callbacks for live status updates.
 import { askClaude } from "./claude.js";
 import { buildSnapshot } from "./supabase.js";
 
@@ -10,11 +12,12 @@ const PERSONA = `Ти си Justin — главният AI асистент на 
 - Говори на български, естествено и по същество. Бъди кратък по подразбиране; разгръщай само ако те помолят.
 - Основавай отговорите си на снимката с данни. Не измисляй проекти, задачи или хора, които ги няма. Ако нещо липсва в данните, кажи го честно.
 - Можеш да обобщаваш, анализираш, приоритизираш, да предлагаш следващи стъпки и да отговаряш на въпроси за състоянието на работата.
+- Имаш достъп до файловата система и можеш да изпълняваш Bash команди, да четеш/поправяш файлове, да използваш GitHub.
+- Можеш да анализираш снимки и изображения, които ти се пращат.
 
 Важно ограничение (засега):
-- В момента си в режим САМО ЧЕТЕНЕ. Още не можеш да създаваш или променяш задачи, проекти и т.н. Ако те помолят за промяна, обясни любезно, че тази възможност предстои да бъде включена, и предложи какво би направил.`;
+- В момента си в режим САМО ЧЕТЕНЕ спрямо Supabase данните. Още не можеш да създаваш или променяш задачи, проекти и т.н. Ако те помолят за промяна, обясни любезно, че тази възможност предстои да бъде включена, и предложи какво би направил.`;
 
-// Short snapshot cache so a burst of messages doesn't hammer the DB.
 let snapCache = { text: "", ts: 0 };
 const SNAP_TTL_MS = 20000;
 
@@ -26,29 +29,46 @@ async function freshSnapshot() {
   return text;
 }
 
-// conversationId -> Claude CLI session id (in-memory; resets on restart)
 const sessions = new Map();
+
+function buildUserContent(message, media) {
+  if (!media || media.length === 0) return message;
+  let content = message || "Виж тази снимка:";
+  for (const item of media) {
+    if (item.type === "image") {
+      content += `\n\n[Изображение: ${item.url}]`;
+    }
+  }
+  return content;
+}
 
 /**
  * Run one agent turn for a given conversation.
  * @param {object} o
- * @param {string} o.conversationId  stable id (platform conv id or "tg:<chatId>")
- * @param {string} o.message         the user's text
- * @param {string} [o.userName]      who is asking (for nicer replies)
- * @returns {Promise<string>} the assistant reply text
+ * @param {string} o.conversationId
+ * @param {string} o.message
+ * @param {string} [o.userName]
+ * @param {Array}  [o.media]         [{ url, type }]
+ * @param {function} [o.onProgress]  callback(statusText)
+ * @returns {Promise<string>}
  */
-export async function runAgent({ conversationId, message, userName }) {
+export async function runAgent({ conversationId, message, userName, media, onProgress }) {
   const snapshot = await freshSnapshot();
   const systemPrompt = `${PERSONA}\n\n${userName ? `Пише ти: ${userName}.\n\n` : ""}${snapshot}`;
 
   const sessionId = sessions.get(conversationId);
-  const { text, sessionId: newSession } = await askClaude({ input: message, systemPrompt, sessionId });
+  const enhancedInput = buildUserContent(message, media);
+  const { text, sessionId: newSession } = await askClaude({
+    input: enhancedInput,
+    systemPrompt,
+    sessionId,
+    onProgress,
+  });
   if (newSession) sessions.set(conversationId, newSession);
 
   return text;
 }
 
-/** Drop a conversation's session (e.g. "/new" in Telegram). */
 export function resetConversation(conversationId) {
   sessions.delete(conversationId);
 }

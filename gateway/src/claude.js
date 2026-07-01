@@ -1,44 +1,39 @@
-// Drives the Claude CLI in headless mode using the machine's logged-in
-// subscription (NOT the Anthropic API / tokens). Read-only by construction:
-// all tools are disabled and any inherited MCP config is ignored, so the
-// agent can only produce text grounded on the prompt we give it.
+// Drives the Claude CLI in pipe mode using the machine's logged-in
+// subscription (Claude Max OAuth). Supports intermediate progress
+// updates via onProgress callback when stderr contains status info.
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { config } from "./config.js";
 
-// Belt-and-suspenders: block every built-in tool. The agent has no business
-// touching the filesystem/shell/web on the clawbox machine.
-const BLOCKED_TOOLS = [
-  "Bash", "Read", "Write", "Edit", "Glob", "Grep",
-  "WebFetch", "WebSearch", "NotebookEdit", "Task", "TodoWrite",
-].join(",");
+// Tool permissions — only pass --disallowedTools when non-empty
+const BLOCKED = (process.env.BLOCKED_TOOLS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
 
 function ensureWorkspace() {
-  try {
-    mkdirSync(config.workspaceDir, { recursive: true });
-  } catch {
-    /* already exists */
-  }
+  try { mkdirSync(config.workspaceDir, { recursive: true }); } catch {}
 }
 
 /**
  * Run one agent turn.
  * @param {object} o
- * @param {string} o.input         the user's message
- * @param {string} o.systemPrompt  Justin persona + workspace snapshot
- * @param {string} [o.sessionId]   resume an existing CLI session for continuity
+ * @param {string} o.input
+ * @param {string} o.systemPrompt
+ * @param {string} [o.sessionId]
+ * @param {function} [o.onProgress]  callback(statusText)
  * @returns {Promise<{ text: string, sessionId: string|null }>}
  */
-export function askClaude({ input, systemPrompt, sessionId }) {
+export function askClaude({ input, systemPrompt, sessionId, onProgress }) {
   ensureWorkspace();
 
   const args = [
     "-p",
     "--output-format", "json",
     "--append-system-prompt", systemPrompt,
-    "--strict-mcp-config",            // ignore any .mcp.json on disk
-    "--disallowedTools", BLOCKED_TOOLS,
+    "--strict-mcp-config",
   ];
+  if (BLOCKED.length) args.push("--disallowedTools", BLOCKED.join(","));
+  // Skip permissions so all tools (bash, web, github) work without prompts
+  args.push("--permission-mode", "bypassPermissions");
   if (config.claudeModel) args.push("--model", config.claudeModel);
   if (sessionId) args.push("--resume", sessionId);
 
@@ -57,18 +52,34 @@ export function askClaude({ input, systemPrompt, sessionId }) {
       if (settled) return;
       settled = true;
       child.kill("SIGKILL");
-      resolve({ text: "⏱️ Заявката отне твърде дълго и беше прекъсната. Опитай отново или формулирай по-кратко.", sessionId: sessionId ?? null });
+      resolve({ text: "⏱️ Заявката отне твърде дълго и беше прекъсната.", sessionId: sessionId ?? null });
     }, config.agentTimeoutMs);
 
+    // Monitor stderr for progress updates (Claude CLI sometimes emits tool names)
+    child.stderr.on("data", (d) => {
+      const chunk = d.toString();
+      stderr += chunk;
+
+      if (onProgress) {
+        const line = chunk.trim();
+        // Tool brackets: [Read], [Bash], etc.
+        if (line.startsWith("[")) {
+          const clean = line.replace(/^\[+|\]+$/g, "").trim();
+          if (clean && clean !== String(child.pid)) {
+            onProgress(clean);
+          }
+        }
+      }
+    });
+
     child.stdout.on("data", (d) => (stdout += d));
-    child.stderr.on("data", (d) => (stderr += d));
 
     child.on("error", (e) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       console.error("[claude] spawn error:", e.message);
-      resolve({ text: `⚠️ Не успях да стартирам Claude CLI (${e.message}). Провери, че \`${config.claudeBin}\` е инсталиран и логнат.`, sessionId: sessionId ?? null });
+      resolve({ text: `⚠️ Грешка: ${e.message}`, sessionId: sessionId ?? null });
     });
 
     child.on("close", (code) => {
@@ -77,7 +88,7 @@ export function askClaude({ input, systemPrompt, sessionId }) {
       clearTimeout(timer);
 
       if (code !== 0 && !stdout.trim()) {
-        console.error(`[claude] exited ${code}:`, stderr.slice(0, 500));
+        console.error(`[claude] exited ${code}:`, stderr.slice(0, 300));
         resolve({ text: "⚠️ Възникна грешка при обработката. Опитай пак след малко.", sessionId: sessionId ?? null });
         return;
       }
@@ -87,7 +98,6 @@ export function askClaude({ input, systemPrompt, sessionId }) {
         const text = parsed.result ?? parsed.text ?? stdout;
         resolve({ text: String(text).trim(), sessionId: parsed.session_id ?? sessionId ?? null });
       } catch {
-        // not JSON — return raw output
         resolve({ text: stdout.trim() || "(празен отговор)", sessionId: sessionId ?? null });
       }
     });

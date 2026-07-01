@@ -35,7 +35,7 @@ export const config = {
   claudeModel: process.env.CLAUDE_MODEL || "",
   agentTimeoutMs: num(process.env.AGENT_TIMEOUT_MS, 180000),
 
-  workspaceDir: resolve(__dirname, "..", "agent-workspace"),
+  workspaceDir: resolve(__dirname, "..", process.env.AGENTS_WORKSPACE || "agent-workspace"),
 };
 
 /** Warn (don't crash) about anything missing, so partial setups still boot. */
