@@ -49,48 +49,31 @@ function uid() {
   return `msg_${Date.now()}_${++_i}`;
 }
 
-// ─── API call to the Justin chatbot ─────────────────────────────
+// ─── API call to the real Justin gateway ────────────────────────
 async function askJustin(
   messages: { role: string; content: string }[],
-  onChunk: (text: string) => void,
+  _onChunk: (text: string) => void,
   onTool: (tool: string) => void,
 ): Promise<string> {
-  // For now — simulate a response, will connect to the real gateway.
-  // Replace this with a streaming fetch to the backend later.
-  const last = messages[messages.length - 1]?.content ?? "";
-  await new Promise((r) => setTimeout(r, 500 + Math.random() * 800));
+  onTool("🤔 Изпращам заявка…");
 
-  const replies: Record<string, string> = {
-    "какво да свърша днес": "Ето какво е актуално днес:\n\n• **OpenDesign** — финализиране на Hero секцията (очаква преглед)\n• **Looper** — имплементация на feedback системата (в прогрес)\n\nС кое да започнем?",
-    "здравей": "Здрасти! 👋 Какво ще правим днес?",
-    "здравейте": "Здравейте! 👋 Какво ще правим днес?",
-    "хей": "Хей! Какво става?",
-    "какво правиш": "Работя по проектите! На разположение съм за каквото ти трябва.",
-  };
+  const res = await fetch("/api/agent", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      message: messages[messages.length - 1]?.content ?? "",
+      conversation_id: `web:${Date.now()}`,
+      user_name: "Justin",
+    }),
+    signal: AbortSignal.timeout(290_000),
+  });
 
-  const lower = last.toLowerCase().trim();
-  for (const [key, reply] of Object.entries(replies)) {
-    if (lower.startsWith(key) || lower === key) {
-      return reply;
-    }
+  const data = await res.json();
+  if (data.error) {
+    throw new Error(data.error);
   }
 
-  onTool("🤔 Мисля…");
-  await new Promise((r) => setTimeout(r, 400));
-
-  const answers = [
-    "Разбрах! Дай ми момент да обработя това.\n\nЩе проверя какво може да се направи и ще ти кажа веднага.",
-    "Прието! Работя по въпроса.\n\nКато имам повече информация, ще ти обобщя.",
-    "Добра идея! Нека да видим какво можем да направим.\n\nОчаквай скоро резултат.",
-    `Разбирам какво искаш. Ето какво мога да направя:\n\n1. Да проверя актуалните задачи и проекти\n2. Да анализирам какво е спешно\n3. Да ти предложа следващи стъпки\n\nКое ти трябва?`,
-  ];
-
-  onTool("💻 Анализирам…");
-  await new Promise((r) => setTimeout(r, 300));
-
-  const body = last.length > 10 ? last.slice(0, 10) : last;
-  const idx = body.length % answers.length;
-  return answers[idx];
+  return data.reply || "(няма отговор)";
 }
 
 // ─── Main chat view ─────────────────────────────────────────────
